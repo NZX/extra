@@ -55,7 +55,7 @@ class ServerOptions(NamedTuple):
 	# SEE: https://repost.aws/questions/QU-_rSWDtwSmOD5wBO5tsrwg/load-balancer-502-bad-gateway
 	keepalive: float = 3_600
 	logRequests: bool = True
-    stopSignals: bool = True
+	stopSignals: bool = True
 	condition: Callable[[], bool] | None = None
 	stopSignals: bool = True
 
