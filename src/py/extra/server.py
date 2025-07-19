@@ -414,17 +414,17 @@ class AIOSocketServer:
 			loop = asyncio.new_event_loop()
 
         # Manage server state
-        state = ServerState()
+		state = ServerState()
         # Registers handlers for signals and exception (so that we log them). Note
         # that we'll get a `set_wakeup_fd only works in main thread of the main interpreter`
         # when this is not run out of the main thread.
-        if (
+		if (
             options.stopSignals
             and threading.current_thread() is threading.main_thread()
         ):
-            loop.add_signal_handler(SIGINT, lambda: state.stop())
-            loop.add_signal_handler(SIGTERM, lambda: state.stop())
-        loop.set_exception_handler(state.onException)
+			loop.add_signal_handler(SIGINT, lambda: state.stop())
+			loop.add_signal_handler(SIGTERM, lambda: state.stop())
+			loop.set_exception_handler(state.onException)
 
 		info(
 			"Extra AIO Server listening",
