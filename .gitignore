@@ -1,4 +1,3 @@
-attic
 .data/*.txt
 
 build/
@@ -175,3 +174,8 @@ poetry.toml
 
 # LSP config files
 pyrightconfig.json
+*.pyc
+/attic
+/.pyre
+/.opencode
+/build
