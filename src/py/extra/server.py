@@ -33,7 +33,15 @@ class ServerState:
     ) -> None:
         e = context.get("exception")
         if e:
-            exception(e)
+            if isinstance(e, asyncio.InvalidStateError):
+                # Known race condition between wait_for timeout and sock_accept
+                # callback. Log as warning rather than exception to avoid alarm.
+                warning(
+                    "AsyncIO InvalidStateError (likely accept race)",
+                    Error=str(e),
+                )
+            else:
+                exception(e)
 
 
 class ServerOptions(NamedTuple):
@@ -354,92 +362,116 @@ class AIOSocketServer:
         app: Application,
         options: ServerOptions = ServerOptions(),
     ) -> None:
-        """Main server coroutine (Optimized)."""
-        
-        loop = asyncio.get_running_loop()
-
-        # Use socket.create_server (Python 3.8+)
-        # Handles IPv6/IPv4, reuse_port, and cleanup automatically.
-        server = socket.create_server(
-            (options.host, options.port),
-            family=socket.AF_INET,
-            backlog=options.backlog,
-            reuse_port=True,
-            dualstack_ipv6=False 
-        )
-        server.setblocking(False)
+        """Main server coroutine."""
+        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         server.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        server.bind((options.host, options.port))
+        # The argument is the backlog of connections that will be accepted before
+        # they are refused.
+        server.listen(options.backlog)
+        # This is what we need to use it with asyncio
+        server.setblocking(False)
 
         tasks: set[asyncio.Task[None]] = set()
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+
+        # Manage server state
         state = ServerState()
-
-        # Signal Handling
-        # We need to cancel the current task to break out of the await loop.sock_accept
-        main_task = asyncio.current_task(loop)
-        
-        def signal_handler():
-            state.stop()
-            if main_task:
-                main_task.cancel()
-
+        # Registers handlers for signals and exception (so that we log them). Note
+        # that we'll get a `set_wakeup_fd only works in main thread of the main interpreter`
+        # when this is not run out of the main thread.
         if (
             options.stopSignals
             and threading.current_thread() is threading.main_thread()
         ):
-            for sig in (SIGINT, SIGTERM):
-                try:
-                    loop.add_signal_handler(sig, signal_handler)
-                except NotImplementedError:
-                    pass
-                    
+            loop.add_signal_handler(SIGINT, lambda: state.stop())
+            loop.add_signal_handler(SIGTERM, lambda: state.stop())
         loop.set_exception_handler(state.onException)
 
         info(
-            "Extra AIO Server listening (Optimized)",
+            "Extra AIO Server listening",
             icon="🚀",
             Host=options.host,
             Port=options.port,
         )
 
         try:
+            # We use a persistent accept task instead of creating a new one each
+            # iteration via wait_for. This avoids the known race condition where
+            # wait_for cancels the sock_accept future but the internal _sock_accept
+            # callback still fires, causing InvalidStateError and leaking the
+            # accepted socket file descriptor.
+            accept_task: asyncio.Task | None = None
             while state.isRunning:
                 if options.condition and not options.condition():
                     break
-
                 try:
-                    # Direct await - no wait_for. This removes the race condition causing InvalidStateError.
-                    client, _ = await loop.sock_accept(server)
+                    if accept_task is None:
+                        accept_task = loop.create_task(
+                            loop.sock_accept(server)
+                        )
 
+                    # asyncio.wait does NOT cancel the future on timeout,
+                    # unlike asyncio.wait_for. The accept_task persists across
+                    # timeout iterations until a connection actually arrives.
+                    done, _ = await asyncio.wait(
+                        {accept_task},
+                        timeout=options.polling or 1.0,
+                    )
+
+                    if accept_task not in done:
+                        # Timeout, no connection yet — loop back and reuse
+                        # the same accept_task.
+                        continue
+
+                    # Connection arrived (or error). Consume the result and
+                    # clear accept_task so a new one is created next iteration.
+                    try:
+                        res = accept_task.result()
+                    except OSError as e:
+                        if e.errno == 24:
+                            # Too many open files — backpressure
+                            await asyncio.sleep(0.1)
+                        else:
+                            exception(e)
+                        accept_task = None
+                        continue
+
+                    accept_task = None
+                    if res is None:
+                        continue
+                    else:
+                        client = res[0]
+                    # NOTE: Should do something with the tasks
                     task = loop.create_task(
                         cls.OnRequest(app, client, loop=loop, options=options)
                     )
                     tasks.add(task)
                     task.add_done_callback(tasks.discard)
-
+                except asyncio.InvalidStateError:
+                    # Defensive: should not happen with the new pattern,
+                    # but guard against it to prevent server crash.
+                    warning("InvalidStateError in accept loop (recovered)")
+                    accept_task = None
+                    continue
                 except asyncio.CancelledError:
-                    state.stop()
                     break
-                except OSError as e:
-                    if e.errno == 24: # Too many open files
-                        warning("Too many open files. Pausing accept loop for 1s.")
-                        await asyncio.sleep(1.0)
-                    else:
-                        exception(e)
-                        await asyncio.sleep(0.1)
-                except Exception as e:
-                    exception(e)
 
         finally:
+            if accept_task and not accept_task.done():
+                accept_task.cancel()
+                try:
+                    await accept_task
+                except (asyncio.CancelledError, Exception):
+                    pass
             server.close()
-            
-            if tasks:
-                info(f"Cancelling {len(tasks)} active tasks...")
-                for task in tasks:
-                    task.cancel()
-                
-                await asyncio.gather(*tasks, return_exceptions=True)
-            
-            info("Server shutdown complete.")
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 def run(
