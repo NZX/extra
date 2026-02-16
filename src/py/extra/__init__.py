@@ -1,4 +1,4 @@
-from .http.model import (
+from .http.model import (  # NOQA: F401
     HTTPRequest,
     HTTPResponse,
     HTTPResponseLine,
